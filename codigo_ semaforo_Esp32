@@ -1,0 +1,212 @@
+//librerias
+#include <EEPROM.h>
+#include <Keypad.h>
+#include <Wire.h>
+#include "RTClib.h"
+
+// pines para el 74hc595
+byte clockpin = 14;
+byte data = 12;
+byte latch = 13;
+byte enabler = 15;
+
+// Pines de detección
+#define PIN_VEH_F1 36
+#define PIN_VEH_F2 39
+#define PIN_PEA_F1 34
+#define PIN_PEA_F2 35
+
+RTC_DS3231 rtc;
+
+// teclado
+const byte ROWS = 3;
+const byte COLS = 2;
+
+char keys[ROWS][COLS] = {
+  { 'L', 'R' },
+  { 'D', 'U' },
+  { 'B', 'O' }
+};
+
+byte rowPins[ROWS] = { 32, 33, 25 };
+byte colPins[COLS] = { 26, 27 };
+
+Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+
+bool btnpress = false;
+
+// estados
+enum Estado { NORMAL, AMARILLO, TODOS_ROJO, APAGADO };
+Estado estado = NORMAL;
+
+unsigned long tiempoInicioFase;
+int faseActual = 0;
+
+byte contador_fases_M = 1;
+byte duracionesVerde[4];
+
+const int duracionAmarillo = 3;
+const int duracionTodosRojo = 2;
+
+byte hora_apagado_M = 23;
+byte minu_apagado_M = 30;
+byte hora_encendido_M = 4;
+byte minu_encendido_M = 30;
+
+// errores
+bool errorDetected = false;
+unsigned long lastErrorBlink = 0;
+bool errorBlinkState = false;
+
+// luces
+const int lights_1_8[] = {0,49,81,134,138,0,0,0,0,146};
+const int lights_9_16[] = {0,128,128,64,64,0,0,0,0,146};
+
+int lights = 0;
+
+// ================= EEPROM =================
+#define EEPROM_SIZE 128
+#define direc_fases 50
+#define direc_tiempo_ledGreen_Fase1 0
+#define direc_tiempo_ledGreen_Fase2 1
+#define direc_tiempo_ledGreen_Fase3 2
+#define direc_tiempo_ledGreen_Fase4 3
+
+void inicializarEEPROM() {
+  EEPROM.begin(EEPROM_SIZE);
+
+  byte readcontador = EEPROM.read(direc_fases);
+
+  if (readcontador == 255) {
+    EEPROM.write(direc_fases, contador_fases_M);
+    EEPROM.write(direc_tiempo_ledGreen_Fase1, 14);
+    EEPROM.write(direc_tiempo_ledGreen_Fase2, 11);
+    EEPROM.write(direc_tiempo_ledGreen_Fase3, 12);
+    EEPROM.write(direc_tiempo_ledGreen_Fase4, 10);
+    EEPROM.commit();
+  } else {
+    contador_fases_M = readcontador;
+    duracionesVerde[0] = EEPROM.read(direc_tiempo_ledGreen_Fase1);
+    duracionesVerde[1] = EEPROM.read(direc_tiempo_ledGreen_Fase2);
+    duracionesVerde[2] = EEPROM.read(direc_tiempo_ledGreen_Fase3);
+    duracionesVerde[3] = EEPROM.read(direc_tiempo_ledGreen_Fase4);
+  }
+}
+
+// ================= ERRORES =================
+void setRedBlink(bool encender) {
+  if (encender) {
+    lights = 9;
+    lights_OUT();
+  } else {
+    apagarLuces();
+  }
+}
+
+void checkVerdes() {
+  bool vehF1 = digitalRead(PIN_VEH_F1) == LOW;
+  bool vehF2 = digitalRead(PIN_VEH_F2) == LOW;
+  bool peaF1 = digitalRead(PIN_PEA_F1) == LOW;
+  bool peaF2 = digitalRead(PIN_PEA_F2) == LOW;
+
+  if (vehF1 && (vehF2 || peaF2)) errorDetected = true;
+  else if (vehF2 && (vehF1 || peaF1)) errorDetected = true;
+  else if (peaF1 && peaF2) errorDetected = true;
+}
+
+void manejarError() {
+  if (millis() - lastErrorBlink >= 500) {
+    lastErrorBlink = millis();
+    errorBlinkState = !errorBlinkState;
+    setRedBlink(errorBlinkState);
+  }
+}
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(PIN_VEH_F1, INPUT);
+  pinMode(PIN_VEH_F2, INPUT);
+  pinMode(PIN_PEA_F1, INPUT);
+  pinMode(PIN_PEA_F2, INPUT);
+
+  rtc.begin();
+  inicializarEEPROM();
+
+  pinMode(clockpin, OUTPUT);
+  pinMode(data, OUTPUT);
+  pinMode(latch, OUTPUT);
+  pinMode(enabler, OUTPUT);
+
+  digitalWrite(enabler, 0);
+
+  tiempoInicioFase = rtc.now().unixtime();
+  cambiarFase(0);
+}
+
+// ================= LOOP =================
+void loop() {
+
+  checkVerdes();
+  if (errorDetected) {
+    manejarError();
+    return;
+  }
+
+  DateTime now = rtc.now();
+  unsigned long tiempoActual = now.unixtime();
+  unsigned long tiempoTranscurrido = tiempoActual - tiempoInicioFase;
+
+  switch (estado) {
+    case NORMAL:
+      if (tiempoTranscurrido >= duracionesVerde[faseActual]) {
+        iniciarTransicion();
+      }
+      break;
+
+    case AMARILLO:
+      if (tiempoTranscurrido >= duracionAmarillo) {
+        estado = TODOS_ROJO;
+        tiempoInicioFase = tiempoActual;
+        lights = 9;
+        lights_OUT();
+      }
+      break;
+
+    case TODOS_ROJO:
+      if (tiempoTranscurrido >= duracionTodosRojo) {
+        estado = NORMAL;
+        tiempoInicioFase = tiempoActual;
+        cambiarFase((faseActual + 1) % contador_fases_M);
+      }
+      break;
+  }
+}
+
+// ================= FUNCIONES =================
+void iniciarTransicion() {
+  estado = AMARILLO;
+  tiempoInicioFase = rtc.now().unixtime();
+  lights = (faseActual * 2) + 2;
+  lights_OUT();
+}
+
+void cambiarFase(int nuevaFase) {
+  apagarLuces();
+  lights = (nuevaFase * 2) + 1;
+  lights_OUT();
+  faseActual = nuevaFase;
+}
+
+void apagarLuces() {
+  lights = 0;
+  lights_OUT();
+}
+
+void lights_OUT() {
+  digitalWrite(latch, LOW);
+  shiftOut(data, clockpin, LSBFIRST, lights_9_16[lights]);
+  shiftOut(data, clockpin, LSBFIRST, lights_1_8[lights]);
+  digitalWrite(latch, HIGH);
+}
